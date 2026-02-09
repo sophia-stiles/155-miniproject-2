@@ -1,0 +1,30 @@
+model:
+  _target_: model.gemma3.Gemma3AlignmentModel
+
+  # VideoPrism branch
+  model_name: "videoprism_lvt_public_v1_base"
+
+  # Gemma 3 (JAX) branch
+  gemma_model_class: "Gemma3_270M"
+  gemma_text_only: true
+  lora_rank: null
+  lora_verbose: false
+
+  # Shared runtime / tokenize options
+  use_bfloat16: false
+  max_length: 64
+  add_bos: true
+
+  # Adapters
+  text_adapter:
+    _target_: atlas.jax.adapter.base.MLPAdapter
+    input_dim: 640
+    output_dim: 768
+  video_adapter: null
+
+trainable_param_patterns:
+  - "^gemma/.*$"
+  # - "^gemma/.*/lora/.*$"
+  - "^text_adapter/.*$"
+  - "^video_adapter/.*$"
+  - "^videoprism/.*$"

@@ -1,0 +1,23 @@
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "proj"
+version = "0.0.1"
+requires-python = ">=3.13"
+dependencies = [
+    "ipykernel",
+    "jaxtyping",
+    "numpy",
+    "torch",
+    "jax",
+    "omegaconf",
+    "orbax-checkpoint",
+    "einops",
+    "decord",
+]
+
+[tool.setuptools]
+packages = ["code", "ckpt"]
