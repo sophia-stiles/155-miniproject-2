@@ -27,3 +27,9 @@ def preprocess_video_text_batch(
     elif isinstance(video_input, np.ndarray):
         video_input = jnp.asarray(video_input)
     return video_input, text_input
+
+def collate_video_text(batch: list[VideoTextDataSample]) -> tuple[torch.Tensor, list[str]]:
+    """PyTorch collate_fn: stack videos into a tensor and collect captions."""
+    video_input = torch.stack([sample.video for sample in batch], dim=0).contiguous()
+    text_input = [sample.caption for sample in batch]
+    return video_input, text_input

@@ -11,9 +11,6 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from omegaconf import DictConfig
 from orbax import checkpoint as ocp
 
-from atlas import logger as atlas_logger
-from atlas.jax.dist import host_local_to_global_array, put_replicated_tree
-
 
 def load_params(
     checkpoint_dir: str | Path,
