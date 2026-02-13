@@ -228,7 +228,7 @@ def get_video_embeddings(
                     str(vf),
                     num_frames,
                     resolution,
-                    decode_method="decord",
+                    decode_method="pyav",
                     resize_method="center_crop_resize",
                     frame_sampling_method="max_stride",
                     output_range="unit",
