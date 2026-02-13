@@ -9,6 +9,8 @@ import torch
 from jax.dlpack import from_dlpack
 from omegaconf import DictConfig
 
+from data.base import VideoTextDataSample
+
 # ==================== Preprocessing ====================
 
 def preprocess_video_text_batch(

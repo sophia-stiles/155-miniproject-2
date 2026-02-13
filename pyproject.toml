@@ -10,6 +10,7 @@ dependencies = [
     "numpy",
     "torch",
     "jax",
+    "flax",
     "omegaconf",
     "orbax-checkpoint",
     "einops",
@@ -21,4 +22,7 @@ dependencies = [
     "keras",
     "absl-py",
     "av",
+    "videoprism",
+    "matplotlib",
+    "scikit-learn",
 ]

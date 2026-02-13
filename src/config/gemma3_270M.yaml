@@ -1,5 +1,5 @@
 model:
-  _target_: mp2.src.model.gemma3.Gemma3AlignmentModel
+  _target_: model.gemma3.Gemma3AlignmentModel
 
   # VideoPrism branch
   model_name: "videoprism_lvt_public_v1_base"
@@ -17,7 +17,7 @@ model:
 
   # Adapters
   text_adapter:
-    _target_: mp2.src.model.adapter.MLPAdapter
+    _target_: model.adapter.MLPAdapter
     input_dim: 640
     output_dim: 768
   video_adapter: null
