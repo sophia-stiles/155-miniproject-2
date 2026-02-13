@@ -14,4 +14,10 @@ dependencies = [
     "orbax-checkpoint",
     "einops",
     "decord",
+    "gdown",
+    "hydra-core",
+    "gemma",
+    "tensorflow",
+    "keras",
+    "absl-py",
 ]
