@@ -268,6 +268,7 @@ def get_video_embeddings(
     annotation_folder: str | Path | None = None,
     segment_key: str = "video_descriptions",
     min_interval_segments: int = 2,
+    segment_progress_every: int = 100,
     model=None,
     params=None,
     num_frames: int = 16,
@@ -297,6 +298,8 @@ def get_video_embeddings(
         segment_key: JSON key that contains a list of segments with ``t0``/``t1``.
         min_interval_segments: Minimum number of valid intervals required to use
             interval decoding; otherwise full-video fallback is used.
+        segment_progress_every: Print interval progress every N decoded segment
+            attempts (in addition to first/last segment per video).
         model: Pre-loaded model object.  If *None*, uses the global singleton.
         params: Pre-loaded model params.  Must be provided together with *model*.
         num_frames: Number of frames to sample per video.
@@ -356,13 +359,10 @@ def get_video_embeddings(
         del video_input, v_emb
         gc.collect()
 
-    emb_list: list[jax.Array] = []
-    labels: list[str] = []
-    pending_tensors: list[torch.Tensor] = []
-    pending_labels: list[str] = []
-
-    for idx, vf in enumerate(video_files, start=1):
-        print(f"  Processing video {idx} / {len(video_files)}: {vf.name} …")
+    # Build a quick plan first so progress can include total segment count.
+    decode_plan: list[tuple[Path, list[tuple[float, float]], bool]] = []
+    total_interval_segments = 0
+    for vf in video_files:
         ann_path = annotation_folder / f"{vf.stem}.json"
         intervals: list[tuple[float, float]] = []
         if ann_path.exists():
@@ -370,15 +370,57 @@ def get_video_embeddings(
                 with open(ann_path) as f:
                     ann_data = json.load(f)
                 intervals = _extract_annotation_intervals(ann_data, segment_key=segment_key)
+            except Exception:
+                intervals = []
+        use_intervals = len(intervals) >= min_interval_segments
+        if use_intervals:
+            total_interval_segments += len(intervals)
+        decode_plan.append((vf, intervals, use_intervals))
+
+    print(
+        f"Planned interval decoding: {total_interval_segments} segments "
+        f"(fallback videos: {sum(1 for _vf, _itv, use_itv in decode_plan if not use_itv)})"
+    )
+    if segment_progress_every < 1:
+        segment_progress_every = 1
+
+    emb_list: list[jax.Array] = []
+    labels: list[str] = []
+    pending_tensors: list[torch.Tensor] = []
+    pending_labels: list[str] = []
+    global_segment_done = 0
+    global_segment_ok = 0
+
+    for idx, (vf, intervals, use_intervals) in enumerate(decode_plan, start=1):
+        print(f"  Processing video {idx} / {len(video_files)}: {vf.name} …")
+        ann_path = annotation_folder / f"{vf.stem}.json"
+        if not ann_path.exists():
+            print(f"    NOTE: no annotation for {vf.name} at {ann_path.name} — full-video fallback")
+        elif not use_intervals and len(intervals) == 0:
+            # Distinguish parse failure / missing key from explicit short list.
+            try:
+                with open(ann_path) as f:
+                    ann_data = json.load(f)
+                if segment_key not in ann_data:
+                    print(f"    NOTE: key '{segment_key}' not found in {ann_path.name} — full-video fallback")
             except Exception as exc:
                 print(f"    WARNING: failed to parse {ann_path.name}: {exc} — full-video fallback")
-        else:
-            print(f"    NOTE: no annotation for {vf.name} at {ann_path.name} — full-video fallback")
 
-        use_intervals = len(intervals) >= min_interval_segments
         if use_intervals:
             print(f"    Using {len(intervals)} interval segments from '{segment_key}'")
             for seg_idx, (start_s, end_s) in enumerate(intervals):
+                global_segment_done += 1
+                if (
+                    seg_idx == 0
+                    or seg_idx + 1 == len(intervals)
+                    or global_segment_done % segment_progress_every == 0
+                ):
+                    print(
+                        "    Segment progress: "
+                        f"video {seg_idx + 1}/{len(intervals)} | "
+                        f"global {global_segment_done}/{total_interval_segments} "
+                        f"(ok={global_segment_ok})"
+                    )
                 try:
                     video_tensor, _meta = decode(
                         str(vf),
@@ -400,6 +442,7 @@ def get_video_embeddings(
                         continue
                     pending_tensors.append(video_tensor)
                     pending_labels.append(f"{vf.stem}#seg{seg_idx:03d}")
+                    global_segment_ok += 1
                 except Exception as exc:
                     print(f"    WARNING: failed interval decode for {vf.name} seg {seg_idx}: {exc} — skipping")
                     continue
@@ -445,6 +488,12 @@ def get_video_embeddings(
         )
 
     print(f"  Successfully embedded {len(labels)} / {len(video_files)} videos")
+    if total_interval_segments > 0:
+        print(
+            "  Interval decode totals: "
+            f"attempted={global_segment_done}, successful={global_segment_ok}, "
+            f"failed={global_segment_done - global_segment_ok}"
+        )
     return jnp.asarray(np.concatenate(emb_list, axis=0)), labels
 
 
