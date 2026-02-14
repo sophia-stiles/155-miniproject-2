@@ -258,6 +258,38 @@ def _extract_annotation_intervals(
     return intervals
 
 
+def _extract_annotation_segment_texts(
+    data: dict,
+    segment_key: str = "video_descriptions",
+    segment_text_key: str = "text",
+) -> list[tuple[float, float, str]]:
+    """Extract sorted ``(start_s, end_s, text)`` items from annotation JSON."""
+    raw_segments = data.get(segment_key)
+    if not isinstance(raw_segments, list):
+        return []
+
+    items: list[tuple[float, float, str]] = []
+    for seg in raw_segments:
+        if not isinstance(seg, dict):
+            continue
+        start_s = _parse_timecode_to_seconds(seg.get("t0"))
+        end_s = _parse_timecode_to_seconds(seg.get("t1"))
+        text = seg.get(segment_text_key)
+        if start_s is None or end_s is None:
+            continue
+        if end_s <= start_s:
+            continue
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        items.append((float(start_s), float(end_s), text))
+
+    items.sort(key=lambda x: (x[0], x[1]))
+    return items
+
+
 # ---------------------------------------------------------------------------
 # Embedding functions
 # ---------------------------------------------------------------------------
@@ -549,6 +581,11 @@ def get_text_embeddings(
     model=None,
     params=None,
     caption_key: str = "summary",
+    segment_level: bool = False,
+    segment_key: str = "video_descriptions",
+    segment_text_key: str = "text",
+    min_interval_segments: int = 2,
+    fallback_caption_key: str = "summary_multimodal",
     batch_size: int = 32,
 ) -> tuple[jax.Array, list[str]]:
     """Compute L2-normalized text embeddings from ``.json`` caption files.
@@ -563,6 +600,15 @@ def get_text_embeddings(
         model: Pre-loaded model object.  If *None*, uses the global singleton.
         params: Pre-loaded model params.  Must be provided together with *model*.
         caption_key: The JSON key that holds the caption text.
+        segment_level: If *True*, extract text per segment from ``segment_key``
+            and emit labels like ``<stem>#seg000``.
+        segment_key: JSON key containing segment objects with ``t0``/``t1`` and
+            segment text.
+        segment_text_key: Key inside each segment object to embed as text.
+        min_interval_segments: Minimum number of valid segments required to use
+            segment-level text; otherwise fallback to single caption text.
+        fallback_caption_key: Caption key to use for fallback when segment-level
+            extraction is unavailable or too short.
         batch_size: Texts per forward-pass batch.
 
     Returns:
@@ -582,13 +628,35 @@ def get_text_embeddings(
     for jf in json_files:
         with open(jf) as f:
             data = json.load(f)
-        caption = _extract_caption(data, caption_key)
+        if segment_level:
+            segment_items = _extract_annotation_segment_texts(
+                data,
+                segment_key=segment_key,
+                segment_text_key=segment_text_key,
+            )
+            if len(segment_items) >= min_interval_segments:
+                print(
+                    f"  {jf.stem}: using {len(segment_items)} segment texts "
+                    f"from '{segment_key}.{segment_text_key}'"
+                )
+                for seg_idx, (_start_s, _end_s, seg_text) in enumerate(segment_items):
+                    labels.append(f"{jf.stem}#seg{seg_idx:03d}")
+                    texts.append(seg_text)
+                continue
+
+            print(
+                f"  {jf.stem}: only {len(segment_items)} valid segments "
+                f"(< {min_interval_segments}) — using fallback caption"
+            )
+
+        caption = _extract_caption(data, fallback_caption_key)
+        if caption is None:
+            caption = _extract_caption(data, caption_key)
         if caption is None:
             print(f"  Warning: {jf.name} — could not extract caption, skipping")
             continue
         labels.append(jf.stem)
         texts.append(caption)
-        # Show a preview so the user can verify the right text was extracted
         preview = caption[:80].replace("\n", " ")
         print(f"  {jf.stem}: \"{preview}…\"")
 
@@ -684,6 +752,53 @@ def plot_similarity_matrix(
     print(f"Gap:               {diag_mean - off_diag_mean:.4f}")
 
     return None if show else fig
+
+
+def align_embeddings_by_labels(
+    video_embeddings: jax.Array | np.ndarray,
+    video_labels: list[str],
+    text_embeddings: jax.Array | np.ndarray,
+    text_labels: list[str],
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Align video/text embeddings by shared labels in video-label order.
+
+    This is useful before plotting when a few items were skipped on one side
+    (for example, failed segment decode on video side).
+    """
+    video_np = np.asarray(video_embeddings)
+    text_np = np.asarray(text_embeddings)
+    if video_np.shape[0] != len(video_labels):
+        raise ValueError("video_embeddings row count must match len(video_labels)")
+    if text_np.shape[0] != len(text_labels):
+        raise ValueError("text_embeddings row count must match len(text_labels)")
+
+    text_index = {lab: i for i, lab in enumerate(text_labels)}
+    keep_video_indices: list[int] = []
+    keep_text_indices: list[int] = []
+    keep_labels: list[str] = []
+
+    for i, lab in enumerate(video_labels):
+        j = text_index.get(lab)
+        if j is None:
+            continue
+        keep_video_indices.append(i)
+        keep_text_indices.append(j)
+        keep_labels.append(lab)
+
+    if not keep_labels:
+        raise ValueError("No shared labels found between video_labels and text_labels")
+
+    dropped_v = len(video_labels) - len(keep_video_indices)
+    dropped_t = len(text_labels) - len(keep_text_indices)
+    print(
+        f"Aligned by labels: kept={len(keep_labels)}, "
+        f"dropped_video={dropped_v}, dropped_text={dropped_t}"
+    )
+    return (
+        video_np[np.asarray(keep_video_indices)],
+        text_np[np.asarray(keep_text_indices)],
+        keep_labels,
+    )
 
 
 def plot_tsne(
