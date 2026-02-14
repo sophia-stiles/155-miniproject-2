@@ -444,6 +444,7 @@ def plot_similarity_matrix(
     text_embeddings: jax.Array | np.ndarray,
     *,
     labels: list[str] | None = None,
+    show: bool = True,
 ):
     """Plot the cosine-similarity matrix between text and video embeddings.
 
@@ -453,7 +454,7 @@ def plot_similarity_matrix(
         labels: Optional tick labels for each sample.
 
     Returns:
-        The matplotlib ``Figure``.
+        The matplotlib ``Figure`` when ``show=False``; otherwise ``None``.
     """
     import matplotlib.pyplot as plt
 
@@ -488,7 +489,8 @@ def plot_similarity_matrix(
 
     plt.colorbar(im, label="cosine similarity")
     plt.tight_layout()
-    plt.show()
+    if show:
+        plt.show()
 
     # Retrieval statistics
     n = min(n_text, n_video)
@@ -499,7 +501,7 @@ def plot_similarity_matrix(
     print(f"Off-diagonal mean: {off_diag_mean:.4f}")
     print(f"Gap:               {diag_mean - off_diag_mean:.4f}")
 
-    return fig
+    return None if show else fig
 
 
 def plot_tsne(
@@ -509,6 +511,7 @@ def plot_tsne(
     labels: list[str] | None = None,
     seed: int = 42,
     perplexity: float | None = None,
+    show: bool = True,
 ):
     """Plot a joint t-SNE of video and text embeddings.
 
@@ -523,7 +526,7 @@ def plot_tsne(
         perplexity: t-SNE perplexity; auto-chosen if *None*.
 
     Returns:
-        The matplotlib ``Figure``.
+        The matplotlib ``Figure`` when ``show=False``; otherwise ``None``.
     """
     import matplotlib.pyplot as plt
     from sklearn.manifold import TSNE
@@ -586,9 +589,10 @@ def plot_tsne(
     ax.set_xlabel("t-SNE 1")
     ax.set_ylabel("t-SNE 2")
     plt.tight_layout()
-    plt.show()
+    if show:
+        plt.show()
 
-    return fig
+    return None if show else fig
 
 
 # ---------------------------------------------------------------------------
