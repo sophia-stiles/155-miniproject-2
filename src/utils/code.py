@@ -1149,6 +1149,7 @@ def plot_tsne_session(
     alpha: float = 0.85,
     s: float = 35,
     show: bool = True,
+    connect_pairs: bool = True,
 ):
     """Plot baseline points from a fitted t-SNE session."""
     import matplotlib.pyplot as plt
@@ -1159,6 +1160,29 @@ def plot_tsne_session(
     video_ids = list(session["video_ids"])
 
     fig, ax = plt.subplots(figsize=figsize)
+
+    # Draw connections first so they appear behind the points.
+    if connect_pairs:
+        label_to_indices = {}
+        for i, lab in enumerate(labels):
+            if lab not in label_to_indices:
+                label_to_indices[lab] = {}
+            label_to_indices[lab][modalities[i]] = i
+
+        for lab, mods in label_to_indices.items():
+            if "video" in mods and "text" in mods:
+                v_xy = coords[mods["video"]]
+                t_xy = coords[mods["text"]]
+                ax.plot(
+                    [v_xy[0], t_xy[0]],
+                    [v_xy[1], t_xy[1]],
+                    color="gray",
+                    alpha=0.2,
+                    linestyle="--",
+                    linewidth=0.6,
+                    zorder=0,
+                )
+
     unique_video_ids = sorted(set(video_ids))
     for vid in unique_video_ids:
         idx = [i for i, x in enumerate(video_ids) if x == vid]
@@ -1169,7 +1193,17 @@ def plot_tsne_session(
         idx_text = [i for i in idx if modalities[i] == "text"]
         if idx_video:
             xy = coords[np.asarray(idx_video)]
-            ax.scatter(xy[:, 0], xy[:, 1], c=[color], s=s, alpha=alpha, marker="o", label=vid)
+            ax.scatter(
+                xy[:, 0],
+                xy[:, 1],
+                c=[color],
+                s=s,
+                alpha=alpha,
+                marker="o",
+                label=vid,
+                edgecolors="k",
+                linewidths=0.3,
+            )
         if idx_text:
             xy = coords[np.asarray(idx_text)]
             ax.scatter(xy[:, 0], xy[:, 1], c=[color], s=s + 5, alpha=alpha, marker="x")
@@ -1198,6 +1232,7 @@ def overlay_tsne_points(
     s: float = 70,
     alpha: float = 0.95,
     color: Any | None = None,
+    connect_to_baseline: bool = True,
 ) -> np.ndarray:
     """Transform and overlay new points onto an existing baseline t-SNE axes.
 
@@ -1224,6 +1259,35 @@ def overlay_tsne_points(
     if ax is None:
         _fig, ax = plt.subplots(figsize=(8, 6))
 
+    # 1. Draw connections to baseline points with matching labels (opposite modality)
+    if connect_to_baseline:
+        other_mod = "text" if modality == "video" else "video"
+        b_coords = session.get("baseline_coords")
+        b_labels = session.get("labels", [])
+        b_modalities = session.get("modalities", [])
+
+        # Build lookup for baseline points of the other modality
+        baseline_lookup = {}
+        if b_coords is not None:
+            for i, (lab, mod) in enumerate(zip(b_labels, b_modalities)):
+                if mod == other_mod:
+                    baseline_lookup[lab] = b_coords[i]
+
+        for i, lab in enumerate(new_labels):
+            if lab in baseline_lookup:
+                v1 = new_xy[i]
+                v2 = baseline_lookup[lab]
+                ax.plot(
+                    [v1[0], v2[0]],
+                    [v1[1], v2[1]],
+                    color="gray",
+                    alpha=0.4,
+                    linestyle=":",
+                    linewidth=1.2,
+                    zorder=0,
+                )
+
+    # 2. Plot the new points
     point_marker = marker if marker is not None else ("^" if modality == "video" else "P")
     for vid in sorted(set(new_video_ids)):
         idx = [i for i, x in enumerate(new_video_ids) if x == vid]
@@ -1238,7 +1302,7 @@ def overlay_tsne_points(
             alpha=alpha,
             marker=point_marker,
             edgecolors="k",
-            linewidths=0.7,
+            linewidths=1.5,  # Thicker border for overlaid points
         )
 
     return new_xy
