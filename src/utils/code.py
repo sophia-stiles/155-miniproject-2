@@ -271,7 +271,7 @@ def get_video_embeddings(
         if not video_tensors:
             continue
 
-        video_input = jnp.stack([from_dlpack(t) for t in video_tensors], axis=0)
+        video_input = jnp.stack([from_dlpack(t.contiguous()) for t in video_tensors], axis=0)
 
         del video_tensors
         gc.collect()
