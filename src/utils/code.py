@@ -352,6 +352,14 @@ def _compact_text_diff(
     return diff_lines
 
 
+def _preview_text(text: str, max_chars: int = 220) -> str:
+    """Return a one-line preview for readable log output."""
+    compact = " ".join(text.split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 3] + "..."
+
+
 def _diff_video_descriptions_single_file(
     before_annotations_file: str | Path,
     after_annotations_file: str | Path,
@@ -475,6 +483,42 @@ def _diff_video_descriptions_single_file(
                 }
             )
 
+    modified_segments: list[dict[str, Any]] = []
+    for bseg, aseg, iou in boundary_pairs:
+        modified_segments.append(
+            {
+                "before_t0": bseg["start_s"],
+                "before_t1": bseg["end_s"],
+                "after_t0": aseg["start_s"],
+                "after_t1": aseg["end_s"],
+                "time_changed": True,
+                "content_changed": bseg["text"] != aseg["text"],
+                "iou": iou,
+                "content_diff_lines": (
+                    _compact_text_diff(
+                        bseg["text"],
+                        aseg["text"],
+                        max_lines=max_text_diff_lines,
+                    )
+                    if bseg["text"] != aseg["text"]
+                    else []
+                ),
+            }
+        )
+    for item in changed_content_on_same_times:
+        modified_segments.append(
+            {
+                "before_t0": item["start_s"],
+                "before_t1": item["end_s"],
+                "after_t0": item["start_s"],
+                "after_t1": item["end_s"],
+                "time_changed": False,
+                "content_changed": True,
+                "iou": 1.0,
+                "content_diff_lines": item["diff_lines"],
+            }
+        )
+
     before_total_duration = sum(s["end_s"] - s["start_s"] for s in before_segments)
     after_total_duration = sum(s["end_s"] - s["start_s"] for s in after_segments)
     before_counts = Counter(seg["time_key"] for seg in before_segments)
@@ -494,6 +538,24 @@ def _diff_video_descriptions_single_file(
         "changed_text_same_time_count": len(changed_content_on_same_times),
         "before_total_duration_s": before_total_duration,
         "after_total_duration_s": after_total_duration,
+        "num_modified_segments": len(modified_segments),
+        "added_segments": [
+            {
+                "t0": s["start_s"],
+                "t1": s["end_s"],
+                "text": s["text"],
+            }
+            for s in added_segments
+        ],
+        "deleted_segments": [
+            {
+                "t0": s["start_s"],
+                "t1": s["end_s"],
+                "text": s["text"],
+            }
+            for s in removed_segments
+        ],
+        "modified_segments": modified_segments,
         "boundary_examples": [
             {
                 "before_t0": b["start_s"],
@@ -527,30 +589,66 @@ def _diff_video_descriptions_single_file(
             f"added={len(added_segments)}"
         )
         print(f"Text edits : same-time segments with changed text={len(changed_content_on_same_times)}")
+        print(f"Modified   : total modified segments={len(modified_segments)}")
+
+        if added_segments:
+            print("")
+            print("Added segments:")
+            for aseg in added_segments:
+                print(
+                    "  Added a new segment with this text description: "
+                    f"\"{_preview_text(aseg['text'])}\" "
+                    f"(time {_format_seconds_hhmmss(aseg['start_s'])}-{_format_seconds_hhmmss(aseg['end_s'])})"
+                )
+
+        if removed_segments:
+            print("")
+            print("Deleted segments:")
+            for bseg in removed_segments:
+                print(
+                    "  "
+                    "Deleted segment: "
+                    f"\"{_preview_text(bseg['text'])}\" "
+                    f"(time {_format_seconds_hhmmss(bseg['start_s'])}-{_format_seconds_hhmmss(bseg['end_s'])})"
+                )
 
         if boundary_pairs:
             print("")
-            print("Likely boundary edits (old -> new):")
+            print("Modified segments (time changed):")
             for bseg, aseg, iou in boundary_pairs[:max_boundary_examples]:
                 print(
                     "  "
-                    f"{_format_seconds_hhmmss(bseg['start_s'])}-{_format_seconds_hhmmss(bseg['end_s'])}"
-                    " -> "
-                    f"{_format_seconds_hhmmss(aseg['start_s'])}-{_format_seconds_hhmmss(aseg['end_s'])}"
-                    f" | d_start={aseg['start_s'] - bseg['start_s']:+.3f}s"
-                    f", d_end={aseg['end_s'] - bseg['end_s']:+.3f}s"
-                    f", IoU={iou:.2f}"
+                    "Modified segment time from "
+                    f"{_format_seconds_hhmmss(bseg['start_s'])}-{_format_seconds_hhmmss(bseg['end_s'])} "
+                    "to "
+                    f"{_format_seconds_hhmmss(aseg['start_s'])}-{_format_seconds_hhmmss(aseg['end_s'])} "
+                    f"(d_start={aseg['start_s'] - bseg['start_s']:+.3f}s, "
+                    f"d_end={aseg['end_s'] - bseg['end_s']:+.3f}s, IoU={iou:.2f})"
                 )
+                if bseg["text"] != aseg["text"]:
+                    print("    Content for this modified segment also changed:")
+                    diff_lines = _compact_text_diff(
+                        bseg["text"],
+                        aseg["text"],
+                        max_lines=max_text_diff_lines,
+                    )
+                    for line in diff_lines:
+                        print(f"      {line}")
             if len(boundary_pairs) > max_boundary_examples:
-                print(f"  ... {len(boundary_pairs) - max_boundary_examples} more not shown")
+                print(
+                    "  "
+                    f"... {len(boundary_pairs) - max_boundary_examples} more modified-time"
+                    " segments not shown"
+                )
 
         if changed_content_on_same_times:
             print("")
-            print("Text diffs for unchanged time segments:")
+            print("Modified segments (same time, content changed):")
             for item in changed_content_on_same_times[:max_text_diff_examples]:
                 print(
                     "  "
-                    f"[{_format_seconds_hhmmss(item['start_s'])}-{_format_seconds_hhmmss(item['end_s'])}]"
+                    "Modified segment content at time "
+                    f"{_format_seconds_hhmmss(item['start_s'])}-{_format_seconds_hhmmss(item['end_s'])}:"
                 )
                 for line in item["diff_lines"]:
                     print(f"    {line}")
@@ -558,7 +656,7 @@ def _diff_video_descriptions_single_file(
                 print(
                     "  "
                     f"... {len(changed_content_on_same_times) - max_text_diff_examples} more"
-                    " text diffs not shown"
+                    " modified-content segments not shown"
                 )
 
     return report
