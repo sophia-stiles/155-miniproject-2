@@ -7,6 +7,7 @@ name = "proj"
 version = "0.0.1"
 dependencies = [
     "jaxtyping",
+    "typeguard==4.4.4",
     "numpy",
     "torch",
     "jax",
