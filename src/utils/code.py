@@ -33,7 +33,9 @@ Quick start::
 
 from __future__ import annotations
 
+import difflib
 import json
+from collections import Counter
 from typing import Any
 import colorsys
 import hashlib
@@ -41,6 +43,7 @@ import pickle
 import random
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 import jax
@@ -296,6 +299,287 @@ def _extract_annotation_segment_texts(
 
     items.sort(key=lambda x: (x[0], x[1]))
     return items
+
+
+def _format_seconds_hhmmss(seconds: float) -> str:
+    """Format float seconds as ``HH:MM:SS.mmm``."""
+    if seconds < 0:
+        seconds = 0.0
+    hours = int(seconds // 3600)
+    rem = seconds - hours * 3600
+    minutes = int(rem // 60)
+    secs = rem - minutes * 60
+    return f"{hours:02d}:{minutes:02d}:{secs:06.3f}"
+
+
+def _temporal_iou(
+    start_a: float,
+    end_a: float,
+    start_b: float,
+    end_b: float,
+) -> float:
+    """Intersection-over-union of 1D intervals."""
+    inter = max(0.0, min(end_a, end_b) - max(start_a, start_b))
+    if inter <= 0.0:
+        return 0.0
+    union = max(end_a, end_b) - min(start_a, start_b)
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
+def _compact_text_diff(
+    before_text: str,
+    after_text: str,
+    max_lines: int = 10,
+) -> list[str]:
+    """Build a compact unified diff for two text snippets."""
+    before_lines = textwrap.wrap(before_text, width=100) or [""]
+    after_lines = textwrap.wrap(after_text, width=100) or [""]
+    diff_lines = list(
+        difflib.unified_diff(
+            before_lines,
+            after_lines,
+            fromfile="before",
+            tofile="after",
+            lineterm="",
+            n=1,
+        )
+    )
+    if len(diff_lines) > max_lines:
+        hidden = len(diff_lines) - max_lines
+        return diff_lines[:max_lines] + [f"... ({hidden} more diff lines hidden)"]
+    return diff_lines
+
+
+def diff_video_descriptions(
+    before_annotations_file: str | Path,
+    after_annotations_file: str | Path,
+    *,
+    segment_key: str = "video_descriptions",
+    text_key: str = "text",
+    time_precision_decimals: int = 3,
+    boundary_iou_threshold: float = 0.30,
+    max_boundary_examples: int = 8,
+    max_text_diff_examples: int = 10,
+    max_text_diff_lines: int = 10,
+) -> dict[str, Any]:
+    """Compare ``video_descriptions`` between two annotation files.
+
+    The report focuses on:
+      - segment count before vs after
+      - how time intervals changed (unchanged, added, removed, likely boundary edits)
+      - content diffs for segments whose time interval stayed the same
+
+    Args:
+        before_annotations_file: Path to the original annotation JSON.
+        after_annotations_file: Path to the updated annotation JSON.
+        segment_key: Key that stores list-like time segments.
+        text_key: Content key inside each segment (typically ``"text"``).
+        time_precision_decimals: Rounding precision used to define "same" interval.
+        boundary_iou_threshold: IoU threshold for likely boundary edit pairing.
+        max_boundary_examples: Max number of boundary-change examples printed.
+        max_text_diff_examples: Max number of same-interval content diffs printed.
+        max_text_diff_lines: Max unified-diff lines per content change.
+
+    Returns:
+        Dictionary with summary counts and detailed examples.
+    """
+    before_path = Path(before_annotations_file).expanduser().resolve()
+    after_path = Path(after_annotations_file).expanduser().resolve()
+
+    with open(before_path) as f:
+        before_data = json.load(f)
+    with open(after_path) as f:
+        after_data = json.load(f)
+
+    raw_before = before_data.get(segment_key)
+    raw_after = after_data.get(segment_key)
+    if not isinstance(raw_before, list):
+        raise ValueError(f"'{segment_key}' is not a list in {before_path}")
+    if not isinstance(raw_after, list):
+        raise ValueError(f"'{segment_key}' is not a list in {after_path}")
+
+    def _collect_segments(raw_segments: list[Any]) -> list[dict[str, Any]]:
+        segments: list[dict[str, Any]] = []
+        for idx, seg in enumerate(raw_segments):
+            if not isinstance(seg, dict):
+                continue
+            start_s = _parse_timecode_to_seconds(seg.get("t0"))
+            end_s = _parse_timecode_to_seconds(seg.get("t1"))
+            if start_s is None or end_s is None or end_s <= start_s:
+                continue
+            text_value = seg.get(text_key)
+            text = text_value if isinstance(text_value, str) else ""
+            key = (
+                round(float(start_s), time_precision_decimals),
+                round(float(end_s), time_precision_decimals),
+            )
+            segments.append(
+                {
+                    "idx": idx,
+                    "start_s": float(start_s),
+                    "end_s": float(end_s),
+                    "time_key": key,
+                    "text": text.strip(),
+                }
+            )
+        segments.sort(key=lambda x: (x["start_s"], x["end_s"], x["idx"]))
+        return segments
+
+    before_segments = _collect_segments(raw_before)
+    after_segments = _collect_segments(raw_after)
+
+    before_by_key: dict[tuple[float, float], list[dict[str, Any]]] = {}
+    after_by_key: dict[tuple[float, float], list[dict[str, Any]]] = {}
+    for seg in before_segments:
+        before_by_key.setdefault(seg["time_key"], []).append(seg)
+    for seg in after_segments:
+        after_by_key.setdefault(seg["time_key"], []).append(seg)
+
+    same_interval_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    before_unmatched: list[dict[str, Any]] = []
+    after_unmatched: list[dict[str, Any]] = []
+    all_time_keys = sorted(set(before_by_key) | set(after_by_key))
+    for key in all_time_keys:
+        before_list = before_by_key.get(key, [])
+        after_list = after_by_key.get(key, [])
+        shared = min(len(before_list), len(after_list))
+        for i in range(shared):
+            same_interval_pairs.append((before_list[i], after_list[i]))
+        before_unmatched.extend(before_list[shared:])
+        after_unmatched.extend(after_list[shared:])
+
+    # Pair likely boundary edits among unmatched segments using best IoU.
+    boundary_pairs: list[tuple[dict[str, Any], dict[str, Any], float]] = []
+    used_after_idx: set[int] = set()
+    for bseg in before_unmatched:
+        best_idx = None
+        best_iou = 0.0
+        for a_idx, aseg in enumerate(after_unmatched):
+            if a_idx in used_after_idx:
+                continue
+            iou = _temporal_iou(
+                bseg["start_s"],
+                bseg["end_s"],
+                aseg["start_s"],
+                aseg["end_s"],
+            )
+            if iou > best_iou:
+                best_iou = iou
+                best_idx = a_idx
+        if best_idx is not None and best_iou >= boundary_iou_threshold:
+            used_after_idx.add(best_idx)
+            boundary_pairs.append((bseg, after_unmatched[best_idx], best_iou))
+
+    boundary_before_ids = {id(b) for b, _a, _iou in boundary_pairs}
+    boundary_after_ids = {id(a) for _b, a, _iou in boundary_pairs}
+    removed_segments = [s for s in before_unmatched if id(s) not in boundary_before_ids]
+    added_segments = [s for s in after_unmatched if id(s) not in boundary_after_ids]
+
+    changed_content_on_same_times: list[dict[str, Any]] = []
+    for bseg, aseg in same_interval_pairs:
+        if bseg["text"] != aseg["text"]:
+            changed_content_on_same_times.append(
+                {
+                    "start_s": bseg["start_s"],
+                    "end_s": bseg["end_s"],
+                    "before_text": bseg["text"],
+                    "after_text": aseg["text"],
+                    "diff_lines": _compact_text_diff(
+                        bseg["text"],
+                        aseg["text"],
+                        max_lines=max_text_diff_lines,
+                    ),
+                }
+            )
+
+    before_total_duration = sum(s["end_s"] - s["start_s"] for s in before_segments)
+    after_total_duration = sum(s["end_s"] - s["start_s"] for s in after_segments)
+    before_counts = Counter(seg["time_key"] for seg in before_segments)
+    after_counts = Counter(seg["time_key"] for seg in after_segments)
+    same_time_count = sum((before_counts & after_counts).values())
+
+    report = {
+        "before_file": str(before_path),
+        "after_file": str(after_path),
+        "segment_key": segment_key,
+        "num_segments_before": len(before_segments),
+        "num_segments_after": len(after_segments),
+        "same_time_count": same_time_count,
+        "removed_time_count": len(removed_segments),
+        "added_time_count": len(added_segments),
+        "likely_boundary_edit_count": len(boundary_pairs),
+        "changed_text_same_time_count": len(changed_content_on_same_times),
+        "before_total_duration_s": before_total_duration,
+        "after_total_duration_s": after_total_duration,
+        "boundary_examples": [
+            {
+                "before_t0": b["start_s"],
+                "before_t1": b["end_s"],
+                "after_t0": a["start_s"],
+                "after_t1": a["end_s"],
+                "delta_start_s": a["start_s"] - b["start_s"],
+                "delta_end_s": a["end_s"] - b["end_s"],
+                "iou": iou,
+            }
+            for b, a, iou in boundary_pairs[:max_boundary_examples]
+        ],
+        "content_diff_examples": changed_content_on_same_times[:max_text_diff_examples],
+    }
+
+    print("")
+    print("=== video_descriptions diff report ===")
+    print(f"Before file: {before_path}")
+    print(f"After file : {after_path}")
+    print(f"Segments   : before={len(before_segments)} | after={len(after_segments)}")
+    print(
+        "Durations  : "
+        f"before={before_total_duration:.3f}s | after={after_total_duration:.3f}s"
+    )
+    print(
+        "Time match : "
+        f"same={same_time_count}, "
+        f"boundary_edits={len(boundary_pairs)}, "
+        f"removed={len(removed_segments)}, "
+        f"added={len(added_segments)}"
+    )
+    print(f"Text edits : same-time segments with changed text={len(changed_content_on_same_times)}")
+
+    if boundary_pairs:
+        print("")
+        print("Likely boundary edits (old -> new):")
+        for bseg, aseg, iou in boundary_pairs[:max_boundary_examples]:
+            print(
+                "  "
+                f"{_format_seconds_hhmmss(bseg['start_s'])}-{_format_seconds_hhmmss(bseg['end_s'])}"
+                " -> "
+                f"{_format_seconds_hhmmss(aseg['start_s'])}-{_format_seconds_hhmmss(aseg['end_s'])}"
+                f" | d_start={aseg['start_s'] - bseg['start_s']:+.3f}s"
+                f", d_end={aseg['end_s'] - bseg['end_s']:+.3f}s"
+                f", IoU={iou:.2f}"
+            )
+        if len(boundary_pairs) > max_boundary_examples:
+            print(f"  ... {len(boundary_pairs) - max_boundary_examples} more not shown")
+
+    if changed_content_on_same_times:
+        print("")
+        print("Text diffs for unchanged time segments:")
+        for item in changed_content_on_same_times[:max_text_diff_examples]:
+            print(
+                "  "
+                f"[{_format_seconds_hhmmss(item['start_s'])}-{_format_seconds_hhmmss(item['end_s'])}]"
+            )
+            for line in item["diff_lines"]:
+                print(f"    {line}")
+        if len(changed_content_on_same_times) > max_text_diff_examples:
+            print(
+                "  "
+                f"... {len(changed_content_on_same_times) - max_text_diff_examples} more"
+                " text diffs not shown"
+            )
+
+    return report
 
 
 # ---------------------------------------------------------------------------
