@@ -4,7 +4,7 @@ Provides main functions:
     - get_video_embeddings(video_folder, annotation_folder, npz_filepath)
     - get_text_embeddings(annotation_folder, npz_filepath)
     - plot_similarity_matrix(video_data, text_data)
-    - plot_tsne(video_data, text_data, bg_npz_vid_filepath, bg_npz_text_filepath)
+    - plot_tsne(video_data, text_data, bg_npz_vid_filepath, bg_npz_text_filepath, bg_alpha, bg_s, perplexity)
     - build_tsne_baseline(...) / overlay_tsne_points(...)
 
 Quick start::
@@ -871,6 +871,8 @@ def plot_tsne(
     *,
     bg_npz_vid_filepath: str | Path | None = None,
     bg_npz_text_filepath: str | Path | None = None,
+    bg_alpha: float = 0.30,
+    bg_s: float = 15,
     seed: int = 42,
     perplexity: float | None = None,
     axis_padding: float = 0.10,
@@ -902,6 +904,8 @@ def plot_tsne(
             ``video_labels`` (produced by ``get_video_embeddings(..., npz_filepath=...)``).
         bg_npz_text_filepath: ``.npz`` file with keys ``text_embeddings`` and
             ``text_labels`` (produced by ``get_text_embeddings(..., npz_filepath=...)``).
+        bg_alpha: Opacity for background points (default 0.30).
+        bg_s: Marker size for background points (default 15).
         seed: Random seed for t-SNE.
         perplexity: t-SNE perplexity; auto-chosen if *None*.
         axis_padding: Extra padding as fraction of data range.
@@ -995,8 +999,7 @@ def plot_tsne(
     # ---- Layer 1: Background (muted grey) ----------------------------
     if has_background:
         bg_color = "lightgray"
-        bg_alpha = 0.30
-        bg_s = 15
+        # Using bg_alpha and bg_s from parameters
 
         # Background video (circles)
         ax.scatter(
