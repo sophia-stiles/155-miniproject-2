@@ -1338,3 +1338,218 @@ def download_checkpoint(
     gdown.download(gdrive_url, str(out), fuzzy=True)
     print("Download complete.")
     return out
+
+def plot_assignment_tsne(
+    background_npz: str | Path,
+    student_video_emb: np.ndarray,
+    student_video_labels: list[str],
+    student_text_emb: np.ndarray,
+    student_text_labels: list[str],
+    perplexity: int = 30,
+    save_path: str | None = None
+):
+    """
+    Plots a t-SNE of student data overlaid on a pre-computed background.
+    
+    Visual Encoding:
+    - Background points: Small, Light Gray, Transparent.
+    - Student Video segments: Circles (o), Colored by Video ID.
+    - Student Text segments: Triangles (^), Colored by Video ID.
+    - Connections: A line connects a Text segment to its corresponding Video segment.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+    import matplotlib.lines as mlines
+
+    # 1. Load Background Data
+    print(f"Loading background data from {background_npz}...")
+    bg_data = np.load(background_npz)
+    bg_emb = bg_data['embeddings']
+    # We don't strictly need background labels for the plot, just the points
+    
+    # 2. Combine All Data (Background + Student Video + Student Text)
+    # We must run t-SNE on the combined set so they share the same space.
+    combined_emb = np.vstack([bg_emb, student_video_emb, student_text_emb])
+    
+    # Track indices to split them back apart later
+    n_bg = len(bg_emb)
+    n_vid = len(student_video_emb)
+    n_txt = len(student_text_emb)
+    
+    print(f"Running t-SNE on {len(combined_emb)} total points...")
+    tsne = TSNE(n_components=2, init='pca', learning_rate='auto', perplexity=perplexity, random_state=42)
+    all_coords = tsne.fit_transform(combined_emb)
+    
+    # 3. Split Coordinates
+    bg_coords = all_coords[:n_bg]
+    vid_coords = all_coords[n_bg : n_bg + n_vid]
+    txt_coords = all_coords[n_bg + n_vid :]
+    
+    # 4. Setup Plot
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # --- Layer 1: Background (Context) ---
+    ax.scatter(
+        bg_coords[:, 0], bg_coords[:, 1],
+        c='lightgray', alpha=0.3, s=10, 
+        label='Background Data', zorder=1
+    )
+    
+    # --- Layer 2: Student Data (Focus) ---
+    # Helper to extract "root" video name from "video_name#seg001"
+    def get_root(label):
+        return label.split('#')[0]
+
+    # Identify unique videos to assign colors
+    unique_videos = list(set([get_root(l) for l in student_video_labels]))
+    colormap = plt.cm.get_cmap('tab10') # distinct colors
+    
+    # Create a lookup for video coordinates: "video_name#seg001" -> (x, y)
+    video_lookup = {label: coords for label, coords in zip(student_video_labels, vid_coords)}
+
+    print("Plotting student data...")
+    
+    # Plot per video ID so they get the same color
+    for i, video_id in enumerate(unique_videos):
+        color = colormap(i)
+        
+        # A. Plot Video Segments (Circles)
+        # Find indices for this video
+        v_indices = [idx for idx, label in enumerate(student_video_labels) if get_root(label) == video_id]
+        if v_indices:
+            ax.scatter(
+                vid_coords[v_indices, 0], vid_coords[v_indices, 1],
+                color=color, marker='o', s=100, edgecolors='white', linewidth=1.5,
+                label=f"{video_id} (Video)", zorder=3
+            )
+
+        # B. Plot Text Segments (Triangles)
+        t_indices = [idx for idx, label in enumerate(student_text_labels) if get_root(label) == video_id]
+        if t_indices:
+            ax.scatter(
+                txt_coords[t_indices, 0], txt_coords[t_indices, 1],
+                color=color, marker='^', s=120, edgecolors='black', linewidth=1.0,
+                label=f"{video_id} (Text)", zorder=3
+            )
+            
+            # C. Draw Connecting Lines
+            # For every text label, try to find the EXACT matching video segment label
+            for t_idx in t_indices:
+                t_label = student_text_labels[t_idx]
+                t_xy = txt_coords[t_idx]
+                
+                # Check if we have the corresponding video segment in our lookup
+                if t_label in video_lookup:
+                    v_xy = video_lookup[t_label]
+                    
+                    # Draw line
+                    ax.plot(
+                        [t_xy[0], v_xy[0]], [t_xy[1], v_xy[1]],
+                        color=color, alpha=0.6, linestyle='--', linewidth=1.5, zorder=2
+                    )
+
+    # 5. Polish
+    ax.set_title("Student Assignment: Video Segments vs. Text Annotations", fontsize=14)
+    ax.axis('off') # Hide axis numbers for cleaner look
+    
+    # Custom Legend
+    # We want one entry per Video ID, plus symbols for Video/Text
+    handles = []
+    # Background
+    handles.append(mlines.Line2D([], [], color='lightgray', marker='o', linestyle='None', label='Background'))
+    # Shapes
+    handles.append(mlines.Line2D([], [], color='black', marker='o', linestyle='None', label='Video Segment'))
+    handles.append(mlines.Line2D([], [], color='black', marker='^', linestyle='None', label='Text Annotation'))
+    
+    ax.legend(handles=handles, loc='best')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+        print(f"Plot saved to {save_path}")
+    
+    plt.show()
+
+def create_background_dataset(
+    video_folder: str | Path,
+    annotation_folder: str | Path,
+    output_path: str | Path = "background.npz",
+    batch_size: int = 16,
+    force_segment_level: bool = True
+) -> Path:
+    """
+    Generates a consolidated .npz file containing embeddings for all videos 
+    and annotations in the provided folders. 
+    
+    This file is intended to be distributed to students as the 'background' 
+    or 'context' for their t-SNE plots.
+
+    Args:
+        video_folder: Path to folder containing .mp4 files.
+        annotation_folder: Path to folder containing .json files.
+        output_path: Where to save the resulting .npz file.
+        batch_size: Batch size for inference (adjust based on GPU memory).
+        force_segment_level: If True, forces the model to extract segments 
+            (min_interval_segments=1) to ensure the background distribution 
+            matches the students' segment-based work.
+
+    Returns:
+        Path to the saved .npz file.
+    """
+    import numpy as np
+    import os
+
+    # Ensure model is loaded
+    if _model is None:
+        load_model()
+
+    print(f"--- Generating Background Dataset ---")
+    print(f"Video Source: {video_folder}")
+    print(f"Annotation Source: {annotation_folder}")
+
+    # 1. Compute Video Embeddings
+    # We set min_interval_segments=1 if force_segment_level is True.
+    # This prevents the model from falling back to "whole video" embeddings,
+    # ensuring the background points represent specific moments in time.
+    min_segments = 1 if force_segment_level else 2
+    
+    print(f"\n[1/3] Computing Video Embeddings (min_segments={min_segments})...")
+    bg_vid_emb, _ = get_video_embeddings(
+        video_folder,
+        annotation_folder=annotation_folder,
+        min_interval_segments=min_segments,
+        batch_size=batch_size
+    )
+
+    # 2. Compute Text Embeddings
+    print(f"\n[2/3] Computing Text Embeddings...")
+    bg_txt_emb, _ = get_text_embeddings(
+        annotation_folder,
+        segment_level=force_segment_level,
+        segment_key="video_descriptions",
+        segment_text_key="text",
+        batch_size=batch_size * 2 # Text is cheaper, can double batch
+    )
+
+    # 3. Combine and Save
+    print(f"\n[3/3] Saving to {output_path}...")
+    
+    # Concatenate video and text embeddings into one large matrix
+    # Shape: (N_video + N_text, D)
+    full_bg_embeddings = np.concatenate([bg_vid_emb, bg_txt_emb], axis=0)
+    
+    # Ensure output directory exists
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    
+    np.savez_compressed(
+        out, 
+        embeddings=full_bg_embeddings
+    )
+    
+    print(f"Success! Saved {len(full_bg_embeddings)} embeddings.")
+    print(f"Stats: {len(bg_vid_emb)} video segments, {len(bg_txt_emb)} text segments.")
+    
+    return out
