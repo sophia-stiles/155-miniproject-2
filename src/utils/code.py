@@ -5,6 +5,7 @@ Provides four main functions:
     - get_text_embeddings(text_folder)
     - plot_similarity_matrix(video_embeddings, text_embeddings)
     - plot_tsne(video_embeddings, text_embeddings)
+    - build_tsne_baseline(...) / overlay_tsne_points(...)
 
 Quick start::
 
@@ -31,7 +32,12 @@ Quick start::
 from __future__ import annotations
 
 import json
+from typing import Any
+import colorsys
+import hashlib
+import pickle
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -194,6 +200,102 @@ def l2_normalize(x: jax.Array, eps: float = 1e-8) -> jax.Array:
     return x / (jnp.linalg.norm(x, axis=-1, keepdims=True) + eps)
 
 
+def _parse_timecode_to_seconds(value: str | float | int) -> float | None:
+    """Parse a timestamp into seconds.
+
+    Supports:
+      - ``HH:MM:SS(.mmm)``, e.g. ``0:05:46.400``
+      - ``MM:SS(.mmm)``
+      - numeric values already in seconds
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    # Fast path: already numeric text in seconds.
+    try:
+        return float(text)
+    except ValueError:
+        pass
+
+    parts = text.split(":")
+    try:
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = float(parts[2])
+            return hours * 3600.0 + minutes * 60.0 + seconds
+        if len(parts) == 2:
+            minutes = int(parts[0])
+            seconds = float(parts[1])
+            return minutes * 60.0 + seconds
+    except ValueError:
+        return None
+    return None
+
+
+def _extract_annotation_intervals(
+    data: dict,
+    segment_key: str = "video_descriptions",
+) -> list[tuple[float, float]]:
+    """Extract sorted ``(start_s, end_s)`` intervals from annotation JSON."""
+    raw_segments = data.get(segment_key)
+    if not isinstance(raw_segments, list):
+        return []
+
+    intervals: list[tuple[float, float]] = []
+    for seg in raw_segments:
+        if not isinstance(seg, dict):
+            continue
+        start_s = _parse_timecode_to_seconds(seg.get("t0"))
+        end_s = _parse_timecode_to_seconds(seg.get("t1"))
+        if start_s is None or end_s is None:
+            continue
+        if end_s <= start_s:
+            continue
+        intervals.append((float(start_s), float(end_s)))
+
+    intervals.sort(key=lambda x: (x[0], x[1]))
+    return intervals
+
+
+def _extract_annotation_segment_texts(
+    data: dict,
+    segment_key: str = "video_descriptions",
+    segment_text_key: str = "text",
+) -> list[tuple[float, float, str]]:
+    """Extract sorted ``(start_s, end_s, text)`` items from annotation JSON."""
+    raw_segments = data.get(segment_key)
+    if not isinstance(raw_segments, list):
+        return []
+
+    items: list[tuple[float, float, str]] = []
+    for seg in raw_segments:
+        if not isinstance(seg, dict):
+            continue
+        start_s = _parse_timecode_to_seconds(seg.get("t0"))
+        end_s = _parse_timecode_to_seconds(seg.get("t1"))
+        text = seg.get(segment_text_key)
+        if start_s is None or end_s is None:
+            continue
+        if end_s <= start_s:
+            continue
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if not text:
+            continue
+        items.append((float(start_s), float(end_s), text))
+
+    items.sort(key=lambda x: (x[0], x[1]))
+    return items
+
+
 # ---------------------------------------------------------------------------
 # Embedding functions
 # ---------------------------------------------------------------------------
@@ -201,6 +303,10 @@ def l2_normalize(x: jax.Array, eps: float = 1e-8) -> jax.Array:
 def get_video_embeddings(
     video_folder: str | Path,
     *,
+    annotation_folder: str | Path | None = None,
+    segment_key: str = "video_descriptions",
+    min_interval_segments: int = 2,
+    segment_progress_every: int = 100,
     model=None,
     params=None,
     num_frames: int = 16,
@@ -214,11 +320,24 @@ def get_video_embeddings(
     so that the ordering is consistent with :func:`get_text_embeddings` when
     both folders contain files with the same names.
 
-    Videos that fail to decode (corrupt files, unsupported codecs, or videos
-    with fewer frames than ``num_frames``) are skipped with a warning.
+    If a matching annotation file ``<stem>.json`` exists, the function extracts
+    time segments from ``segment_key`` and decodes interval clips by calling
+    :func:`data.utils.decode` with ``frame_sampling_method="interval"``.
+    Overlapping segments are supported and processed independently.
+
+    If no annotation exists, segment extraction fails, or the number of valid
+    segments is below ``min_interval_segments``, the function falls back to
+    full-video decoding (single embedding for that video).
 
     Args:
         video_folder: Path to a directory containing ``.mp4`` video files.
+        annotation_folder: Directory with ``.json`` annotations. If *None*,
+            defaults to ``video_folder``.
+        segment_key: JSON key that contains a list of segments with ``t0``/``t1``.
+        min_interval_segments: Minimum number of valid intervals required to use
+            interval decoding; otherwise full-video fallback is used.
+        segment_progress_every: Print interval progress every N decoded segment
+            attempts (in addition to first/last segment per video).
         model: Pre-loaded model object.  If *None*, uses the global singleton.
         params: Pre-loaded model params.  Must be provided together with *model*.
         num_frames: Number of frames to sample per video.
@@ -239,11 +358,13 @@ def get_video_embeddings(
         model, params = _get_model_and_params()
 
     video_folder = Path(video_folder)
+    annotation_folder = Path(annotation_folder) if annotation_folder is not None else video_folder
     video_files = sorted(video_folder.glob("*.mp4"), key=lambda p: p.stem)
     if not video_files:
         raise FileNotFoundError(f"No .mp4 files found in {video_folder}")
 
     print(f"Found {len(video_files)} videos in {video_folder}")
+    print(f"Using annotations from: {annotation_folder}")
 
     rng = random.Random(seed)
 
@@ -251,15 +372,127 @@ def get_video_embeddings(
     def _jit_video_forward(params, video_input):
         return model.get_adapted_video_embeddings(params, video_input, train=False)
 
+    def _flush_batch(
+        pending_tensors: list[torch.Tensor],
+        pending_labels: list[str],
+        emb_list: list[jax.Array],
+        labels: list[str],
+    ) -> None:
+        """Run one forward pass on pending tensors and append outputs."""
+        if not pending_tensors:
+            return
+        jax_frames = [from_dlpack(t.contiguous()) for t in pending_tensors]
+        del pending_tensors[:]
+        gc.collect()
+
+        video_input = jnp.stack(jax_frames, axis=0)
+        del jax_frames
+        gc.collect()
+
+        v_emb = _jit_video_forward(params, video_input)
+        emb_list.append(np.asarray(l2_normalize(v_emb.astype(jnp.float32))))
+        labels.extend(pending_labels)
+        del pending_labels[:]
+
+        del video_input, v_emb
+        gc.collect()
+
+    # Build a quick plan first so progress can include total segment count.
+    decode_plan: list[tuple[Path, list[tuple[float, float]], bool]] = []
+    total_interval_segments = 0
+    for vf in video_files:
+        ann_path = annotation_folder / f"{vf.stem}.json"
+        intervals: list[tuple[float, float]] = []
+        if ann_path.exists():
+            try:
+                with open(ann_path) as f:
+                    ann_data = json.load(f)
+                intervals = _extract_annotation_intervals(ann_data, segment_key=segment_key)
+            except Exception:
+                intervals = []
+        use_intervals = len(intervals) >= min_interval_segments
+        if use_intervals:
+            total_interval_segments += len(intervals)
+        decode_plan.append((vf, intervals, use_intervals))
+
+    print(
+        f"Planned interval decoding: {total_interval_segments} segments "
+        f"(fallback videos: {sum(1 for _vf, _itv, use_itv in decode_plan if not use_itv)})"
+    )
+    if segment_progress_every < 1:
+        segment_progress_every = 1
+
     emb_list: list[jax.Array] = []
     labels: list[str] = []
-    for i in range(0, len(video_files), batch_size):
-        batch_files = video_files[i : i + batch_size]
-        print(f"  Processing videos {i + 1}–{i + len(batch_files)} / {len(video_files)} …")
+    pending_tensors: list[torch.Tensor] = []
+    pending_labels: list[str] = []
+    global_segment_done = 0
+    global_segment_ok = 0
 
-        video_tensors = []
-        batch_labels = []
-        for vf in batch_files:
+    for idx, (vf, intervals, use_intervals) in enumerate(decode_plan, start=1):
+        print(f"  Processing video {idx} / {len(video_files)}: {vf.name} …")
+        ann_path = annotation_folder / f"{vf.stem}.json"
+        if not ann_path.exists():
+            print(f"    NOTE: no annotation for {vf.name} at {ann_path.name} — full-video fallback")
+        elif not use_intervals and len(intervals) == 0:
+            # Distinguish parse failure / missing key from explicit short list.
+            try:
+                with open(ann_path) as f:
+                    ann_data = json.load(f)
+                if segment_key not in ann_data:
+                    print(f"    NOTE: key '{segment_key}' not found in {ann_path.name} — full-video fallback")
+            except Exception as exc:
+                print(f"    WARNING: failed to parse {ann_path.name}: {exc} — full-video fallback")
+
+        if use_intervals:
+            print(f"    Using {len(intervals)} interval segments from '{segment_key}'")
+            for seg_idx, (start_s, end_s) in enumerate(intervals):
+                global_segment_done += 1
+                if (
+                    seg_idx == 0
+                    or seg_idx + 1 == len(intervals)
+                    or global_segment_done % segment_progress_every == 0
+                ):
+                    print(
+                        "    Segment progress: "
+                        f"video {seg_idx + 1}/{len(intervals)} | "
+                        f"global {global_segment_done}/{total_interval_segments} "
+                        f"(ok={global_segment_ok})"
+                    )
+                try:
+                    video_tensor, _meta = decode(
+                        str(vf),
+                        num_frames,
+                        resolution,
+                        decode_method="pyav",
+                        resize_method="center_crop_resize",
+                        frame_sampling_method="interval",
+                        output_range="unit",
+                        dtype=torch.bfloat16,
+                        rng=rng,
+                        interval=(start_s, end_s),
+                    )
+                    if video_tensor.shape[0] == 0:
+                        print(
+                            f"    WARNING: {vf.name} segment {seg_idx} [{start_s:.3f}, {end_s:.3f}] "
+                            "decoded to 0 frames — skipping"
+                        )
+                        continue
+                    pending_tensors.append(video_tensor)
+                    pending_labels.append(f"{vf.stem}#seg{seg_idx:03d}")
+                    global_segment_ok += 1
+                except Exception as exc:
+                    print(f"    WARNING: failed interval decode for {vf.name} seg {seg_idx}: {exc} — skipping")
+                    continue
+
+                if len(pending_tensors) >= batch_size:
+                    _flush_batch(pending_tensors, pending_labels, emb_list, labels)
+        else:
+            if ann_path.exists():
+                print(
+                    f"    NOTE: only {len(intervals)} valid segments (< {min_interval_segments}); "
+                    "using full-video fallback"
+                )
             try:
                 video_tensor, _meta = decode(
                     str(vf),
@@ -275,35 +508,16 @@ def get_video_embeddings(
                 if video_tensor.shape[0] == 0:
                     print(f"    WARNING: {vf.name} decoded to 0 frames — skipping")
                     continue
-                video_tensors.append(video_tensor)
-                batch_labels.append(vf.stem)
+                pending_tensors.append(video_tensor)
+                pending_labels.append(vf.stem)
             except Exception as exc:
                 print(f"    WARNING: failed to decode {vf.name}: {exc} — skipping")
                 continue
 
-        if not video_tensors:
-            continue
+            if len(pending_tensors) >= batch_size:
+                _flush_batch(pending_tensors, pending_labels, emb_list, labels)
 
-        # Convert each PyTorch tensor to JAX one-at-a-time so the
-        # PyTorch copy can be freed immediately, avoiding holding two
-        # full copies (PyTorch + JAX) of the batch in RAM at once.
-        jax_frames = []
-        for t in video_tensors:
-            jax_frames.append(from_dlpack(t.contiguous()))
-        del video_tensors
-        gc.collect()
-
-        video_input = jnp.stack(jax_frames, axis=0)
-        del jax_frames
-        gc.collect()
-
-        v_emb = _jit_video_forward(params, video_input)
-        # Move to numpy immediately so the JAX device buffer is freed.
-        emb_list.append(np.asarray(l2_normalize(v_emb.astype(jnp.float32))))
-        labels.extend(batch_labels)
-
-        del video_input, v_emb
-        gc.collect()
+    _flush_batch(pending_tensors, pending_labels, emb_list, labels)
 
     if not emb_list:
         raise RuntimeError(
@@ -312,6 +526,12 @@ def get_video_embeddings(
         )
 
     print(f"  Successfully embedded {len(labels)} / {len(video_files)} videos")
+    if total_interval_segments > 0:
+        print(
+            "  Interval decode totals: "
+            f"attempted={global_segment_done}, successful={global_segment_ok}, "
+            f"failed={global_segment_done - global_segment_ok}"
+        )
     return jnp.asarray(np.concatenate(emb_list, axis=0)), labels
 
 
@@ -367,6 +587,11 @@ def get_text_embeddings(
     model=None,
     params=None,
     caption_key: str = "summary",
+    segment_level: bool = False,
+    segment_key: str = "video_descriptions",
+    segment_text_key: str = "text",
+    min_interval_segments: int = 2,
+    fallback_caption_key: str = "summary_multimodal",
     batch_size: int = 32,
 ) -> tuple[jax.Array, list[str]]:
     """Compute L2-normalized text embeddings from ``.json`` caption files.
@@ -381,6 +606,15 @@ def get_text_embeddings(
         model: Pre-loaded model object.  If *None*, uses the global singleton.
         params: Pre-loaded model params.  Must be provided together with *model*.
         caption_key: The JSON key that holds the caption text.
+        segment_level: If *True*, extract text per segment from ``segment_key``
+            and emit labels like ``<stem>#seg000``.
+        segment_key: JSON key containing segment objects with ``t0``/``t1`` and
+            segment text.
+        segment_text_key: Key inside each segment object to embed as text.
+        min_interval_segments: Minimum number of valid segments required to use
+            segment-level text; otherwise fallback to single caption text.
+        fallback_caption_key: Caption key to use for fallback when segment-level
+            extraction is unavailable or too short.
         batch_size: Texts per forward-pass batch.
 
     Returns:
@@ -400,13 +634,35 @@ def get_text_embeddings(
     for jf in json_files:
         with open(jf) as f:
             data = json.load(f)
-        caption = _extract_caption(data, caption_key)
+        if segment_level:
+            segment_items = _extract_annotation_segment_texts(
+                data,
+                segment_key=segment_key,
+                segment_text_key=segment_text_key,
+            )
+            if len(segment_items) >= min_interval_segments:
+                print(
+                    f"  {jf.stem}: using {len(segment_items)} segment texts "
+                    f"from '{segment_key}.{segment_text_key}'"
+                )
+                for seg_idx, (_start_s, _end_s, seg_text) in enumerate(segment_items):
+                    labels.append(f"{jf.stem}#seg{seg_idx:03d}")
+                    texts.append(seg_text)
+                continue
+
+            print(
+                f"  {jf.stem}: only {len(segment_items)} valid segments "
+                f"(< {min_interval_segments}) — using fallback caption"
+            )
+
+        caption = _extract_caption(data, fallback_caption_key)
+        if caption is None:
+            caption = _extract_caption(data, caption_key)
         if caption is None:
             print(f"  Warning: {jf.name} — could not extract caption, skipping")
             continue
         labels.append(jf.stem)
         texts.append(caption)
-        # Show a preview so the user can verify the right text was extracted
         preview = caption[:80].replace("\n", " ")
         print(f"  {jf.stem}: \"{preview}…\"")
 
@@ -504,6 +760,53 @@ def plot_similarity_matrix(
     return None if show else fig
 
 
+def align_embeddings_by_labels(
+    video_embeddings: jax.Array | np.ndarray,
+    video_labels: list[str],
+    text_embeddings: jax.Array | np.ndarray,
+    text_labels: list[str],
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    """Align video/text embeddings by shared labels in video-label order.
+
+    This is useful before plotting when a few items were skipped on one side
+    (for example, failed segment decode on video side).
+    """
+    video_np = np.asarray(video_embeddings)
+    text_np = np.asarray(text_embeddings)
+    if video_np.shape[0] != len(video_labels):
+        raise ValueError("video_embeddings row count must match len(video_labels)")
+    if text_np.shape[0] != len(text_labels):
+        raise ValueError("text_embeddings row count must match len(text_labels)")
+
+    text_index = {lab: i for i, lab in enumerate(text_labels)}
+    keep_video_indices: list[int] = []
+    keep_text_indices: list[int] = []
+    keep_labels: list[str] = []
+
+    for i, lab in enumerate(video_labels):
+        j = text_index.get(lab)
+        if j is None:
+            continue
+        keep_video_indices.append(i)
+        keep_text_indices.append(j)
+        keep_labels.append(lab)
+
+    if not keep_labels:
+        raise ValueError("No shared labels found between video_labels and text_labels")
+
+    dropped_v = len(video_labels) - len(keep_video_indices)
+    dropped_t = len(text_labels) - len(keep_text_indices)
+    print(
+        f"Aligned by labels: kept={len(keep_labels)}, "
+        f"dropped_video={dropped_v}, dropped_text={dropped_t}"
+    )
+    return (
+        video_np[np.asarray(keep_video_indices)],
+        text_np[np.asarray(keep_text_indices)],
+        keep_labels,
+    )
+
+
 def plot_tsne(
     video_embeddings: jax.Array | np.ndarray,
     text_embeddings: jax.Array | np.ndarray,
@@ -511,6 +814,8 @@ def plot_tsne(
     labels: list[str] | None = None,
     seed: int = 42,
     perplexity: float | None = None,
+    axis_padding: float = 0.10,
+    figsize: tuple[float, float] = (10, 8),
     show: bool = True,
 ):
     """Plot a joint t-SNE of video and text embeddings.
@@ -524,6 +829,9 @@ def plot_tsne(
         labels: Optional label per sample (length ``N``).
         seed: Random seed for t-SNE.
         perplexity: t-SNE perplexity; auto-chosen if *None*.
+        axis_padding: Extra margin added around t-SNE points as a fraction of
+            x/y data range (e.g., 0.10 adds 10% padding on each side).
+        figsize: Figure size passed to ``plt.subplots``.
 
     Returns:
         The matplotlib ``Figure`` when ``show=False``; otherwise ``None``.
@@ -555,7 +863,7 @@ def plot_tsne(
     )
     coords = tsne.fit_transform(all_emb)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=figsize)
     unique_labels = sorted(set(labels))
     cmap = plt.cm.get_cmap("tab10", len(unique_labels))
     label_to_color = {lab: cmap(i) for i, lab in enumerate(unique_labels)}
@@ -577,6 +885,16 @@ def plot_tsne(
             color=label_to_color[labels[i]], alpha=0.3, linestyle="--", linewidth=0.8,
         )
 
+    # Expand axis limits so dense clusters and labels are easier to inspect.
+    x_min, x_max = float(np.min(coords[:, 0])), float(np.max(coords[:, 0]))
+    y_min, y_max = float(np.min(coords[:, 1])), float(np.max(coords[:, 1]))
+    x_range = max(x_max - x_min, 1e-8)
+    y_range = max(y_max - y_min, 1e-8)
+    x_pad = x_range * max(axis_padding, 0.0)
+    y_pad = y_range * max(axis_padding, 0.0)
+    ax.set_xlim(x_min - x_pad, x_max + x_pad)
+    ax.set_ylim(y_min - y_pad, y_max + y_pad)
+
     # Legend for labels
     for lab in unique_labels:
         ax.scatter([], [], c=[label_to_color[lab]], marker="s", label=lab)
@@ -593,6 +911,401 @@ def plot_tsne(
         plt.show()
 
     return None if show else fig
+
+
+def _to_numpy_2d(x: jax.Array | np.ndarray, *, name: str) -> np.ndarray:
+    """Convert input to a 2D numpy array."""
+    arr = np.asarray(x)
+    if arr.ndim != 2:
+        raise ValueError(f"{name} must be 2D with shape (N, D); got shape {arr.shape}")
+    return arr
+
+
+def _strip_segment_suffix(label: str) -> str:
+    """Map labels like '<video>#seg003' to '<video>'."""
+    return re.sub(r"#seg\d+$", "", str(label))
+
+
+def _stable_color_for_video_id(video_id: str) -> tuple[float, float, float]:
+    """Generate a deterministic RGB color for a video id."""
+    digest = hashlib.md5(video_id.encode("utf-8")).hexdigest()
+    hue = int(digest[:8], 16) / float(16**8 - 1)
+    # Keep saturation/value fixed for readability and contrast.
+    return colorsys.hsv_to_rgb(hue, 0.65, 0.90)
+
+
+def save_embeddings_npz(
+    output_path: str | Path,
+    video_embeddings: jax.Array | np.ndarray,
+    video_labels: list[str],
+    *,
+    text_embeddings: jax.Array | np.ndarray | None = None,
+    text_labels: list[str] | None = None,
+) -> Path:
+    """Save embeddings + labels into a compressed .npz file.
+
+    Saved keys:
+      - video_embeddings (N_video, D)
+      - video_labels (N_video,)
+      - text_embeddings (N_text, D), optional
+      - text_labels (N_text,), optional
+    """
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    video_np = _to_numpy_2d(video_embeddings, name="video_embeddings")
+    if len(video_labels) != video_np.shape[0]:
+        raise ValueError("len(video_labels) must match video_embeddings rows")
+
+    payload: dict[str, np.ndarray] = {
+        "video_embeddings": video_np.astype(np.float32, copy=False),
+        "video_labels": np.asarray(video_labels, dtype=str),
+    }
+
+    if text_embeddings is not None:
+        text_np = _to_numpy_2d(text_embeddings, name="text_embeddings")
+        payload["text_embeddings"] = text_np.astype(np.float32, copy=False)
+        if text_labels is None:
+            text_labels = [f"text_{i}" for i in range(text_np.shape[0])]
+        if len(text_labels) != text_np.shape[0]:
+            raise ValueError("len(text_labels) must match text_embeddings rows")
+        payload["text_labels"] = np.asarray(text_labels, dtype=str)
+    elif text_labels is not None:
+        raise ValueError("text_labels was provided but text_embeddings is None")
+
+    np.savez_compressed(output, **payload)
+    return output
+
+
+def load_embeddings_npz(npz_path: str | Path) -> dict[str, np.ndarray | list[str] | None]:
+    """Load embedding arrays from .npz with tolerant key aliases."""
+    path = Path(npz_path).expanduser().resolve()
+    with np.load(path, allow_pickle=True) as data:
+        keys = set(data.files)
+
+        def _pick(candidates: list[str], required: bool) -> np.ndarray | None:
+            for key in candidates:
+                if key in keys:
+                    return np.asarray(data[key])
+            if required:
+                raise KeyError(f"Missing required key. Tried {candidates}, found {sorted(keys)}")
+            return None
+
+        video_embeddings = _pick(["video_embeddings", "video_embeds", "video_emb"], required=True)
+        video_labels = _pick(["video_labels", "labels", "video_ids"], required=True)
+        text_embeddings = _pick(["text_embeddings", "text_embeds", "text_emb"], required=False)
+        text_labels = _pick(["text_labels", "caption_labels"], required=False)
+
+    video_np = _to_numpy_2d(video_embeddings, name="video_embeddings")
+    video_labels_list = [str(x) for x in np.asarray(video_labels).tolist()]
+    if len(video_labels_list) != video_np.shape[0]:
+        raise ValueError("video_labels length does not match video_embeddings rows")
+
+    text_np: np.ndarray | None = None
+    text_labels_list: list[str] | None = None
+    if text_embeddings is not None:
+        text_np = _to_numpy_2d(text_embeddings, name="text_embeddings")
+        if text_labels is None:
+            text_labels_list = [f"text_{i}" for i in range(text_np.shape[0])]
+        else:
+            text_labels_list = [str(x) for x in np.asarray(text_labels).tolist()]
+            if len(text_labels_list) != text_np.shape[0]:
+                raise ValueError("text_labels length does not match text_embeddings rows")
+
+    return {
+        "video_embeddings": video_np.astype(np.float32, copy=False),
+        "video_labels": video_labels_list,
+        "text_embeddings": None if text_np is None else text_np.astype(np.float32, copy=False),
+        "text_labels": text_labels_list,
+    }
+
+
+def build_tsne_baseline(
+    video_embeddings: jax.Array | np.ndarray,
+    video_labels: list[str],
+    *,
+    text_embeddings: jax.Array | np.ndarray | None = None,
+    text_labels: list[str] | None = None,
+    perplexity: float = 30.0,
+    metric: str = "cosine",
+    random_state: int = 42,
+    standardize: bool = True,
+) -> dict:
+    """Fit an openTSNE baseline that can later transform new points.
+
+    Returns a pickle-serializable session dict containing:
+      - baseline_coords: (N, 2) baseline t-SNE coordinates
+      - labels/modality/video_ids for baseline points
+      - tsne_model: fitted openTSNE embedding object (supports transform)
+      - scaler: fitted StandardScaler or None
+    """
+    try:
+        from openTSNE import TSNE
+    except ImportError as exc:
+        raise ImportError(
+            "openTSNE is required for incremental t-SNE transforms. "
+            "Install with: pip install openTSNE"
+        ) from exc
+
+    video_np = _to_numpy_2d(video_embeddings, name="video_embeddings")
+    if len(video_labels) != video_np.shape[0]:
+        raise ValueError("len(video_labels) must match video_embeddings rows")
+
+    labels: list[str] = [str(x) for x in video_labels]
+    modalities: list[str] = ["video"] * len(labels)
+    all_parts: list[np.ndarray] = [video_np]
+
+    if text_embeddings is not None:
+        text_np = _to_numpy_2d(text_embeddings, name="text_embeddings")
+        if text_labels is None:
+            text_labels = [f"text_{i}" for i in range(text_np.shape[0])]
+        if len(text_labels) != text_np.shape[0]:
+            raise ValueError("len(text_labels) must match text_embeddings rows")
+        all_parts.append(text_np)
+        labels.extend([str(x) for x in text_labels])
+        modalities.extend(["text"] * text_np.shape[0])
+
+    all_emb = np.concatenate(all_parts, axis=0).astype(np.float32, copy=False)
+
+    scaler = None
+    all_emb_proc = all_emb
+    if standardize:
+        from sklearn.preprocessing import StandardScaler
+
+        scaler = StandardScaler()
+        all_emb_proc = scaler.fit_transform(all_emb).astype(np.float32, copy=False)
+
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        metric=metric,
+        random_state=random_state,
+        initialization="pca",
+    )
+    embedding = tsne.fit(all_emb_proc)
+    coords = np.asarray(embedding, dtype=np.float32)
+    video_ids = [_strip_segment_suffix(lab) for lab in labels]
+
+    return {
+        "baseline_coords": coords,
+        "labels": labels,
+        "modalities": modalities,
+        "video_ids": video_ids,
+        "tsne_model": embedding,
+        "scaler": scaler,
+        "config": {
+            "perplexity": perplexity,
+            "metric": metric,
+            "random_state": random_state,
+            "standardize": standardize,
+        },
+    }
+
+
+def build_tsne_baseline_from_npz(
+    npz_path: str | Path,
+    *,
+    perplexity: float = 30.0,
+    metric: str = "cosine",
+    random_state: int = 42,
+    standardize: bool = True,
+) -> dict:
+    """Load embeddings from .npz and fit an incremental t-SNE baseline."""
+    loaded = load_embeddings_npz(npz_path)
+    return build_tsne_baseline(
+        loaded["video_embeddings"],
+        loaded["video_labels"],
+        text_embeddings=loaded["text_embeddings"],
+        text_labels=loaded["text_labels"],
+        perplexity=perplexity,
+        metric=metric,
+        random_state=random_state,
+        standardize=standardize,
+    )
+
+
+def save_tsne_session(session: dict, output_path: str | Path) -> Path:
+    """Persist a t-SNE baseline session to disk with pickle."""
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, "wb") as f:
+        pickle.dump(session, f)
+    return output
+
+
+def load_tsne_session(session_path: str | Path) -> dict:
+    """Load a previously saved t-SNE baseline session."""
+    path = Path(session_path).expanduser().resolve()
+    with open(path, "rb") as f:
+        session = pickle.load(f)
+    return session
+
+
+def plot_tsne_session(
+    session: dict,
+    *,
+    figsize: tuple[float, float] = (11, 8),
+    title: str = "Baseline t-SNE: Video/Text Embeddings",
+    alpha: float = 0.85,
+    s: float = 35,
+    show: bool = True,
+    connect_pairs: bool = True,
+):
+    """Plot baseline points from a fitted t-SNE session."""
+    import matplotlib.pyplot as plt
+
+    coords = np.asarray(session["baseline_coords"])
+    labels = list(session["labels"])
+    modalities = list(session["modalities"])
+    video_ids = list(session["video_ids"])
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    # Draw connections first so they appear behind the points.
+    if connect_pairs:
+        label_to_indices = {}
+        for i, lab in enumerate(labels):
+            if lab not in label_to_indices:
+                label_to_indices[lab] = {}
+            label_to_indices[lab][modalities[i]] = i
+
+        for lab, mods in label_to_indices.items():
+            if "video" in mods and "text" in mods:
+                v_xy = coords[mods["video"]]
+                t_xy = coords[mods["text"]]
+                ax.plot(
+                    [v_xy[0], t_xy[0]],
+                    [v_xy[1], t_xy[1]],
+                    color="gray",
+                    alpha=0.2,
+                    linestyle="--",
+                    linewidth=0.6,
+                    zorder=0,
+                )
+
+    unique_video_ids = sorted(set(video_ids))
+    for vid in unique_video_ids:
+        idx = [i for i, x in enumerate(video_ids) if x == vid]
+        if not idx:
+            continue
+        color = _stable_color_for_video_id(vid)
+        idx_video = [i for i in idx if modalities[i] == "video"]
+        idx_text = [i for i in idx if modalities[i] == "text"]
+        if idx_video:
+            xy = coords[np.asarray(idx_video)]
+            ax.scatter(
+                xy[:, 0],
+                xy[:, 1],
+                c=[color],
+                s=s,
+                alpha=alpha,
+                marker="o",
+                label=vid,
+                edgecolors="k",
+                linewidths=0.3,
+            )
+        if idx_text:
+            xy = coords[np.asarray(idx_text)]
+            ax.scatter(xy[:, 0], xy[:, 1], c=[color], s=s + 5, alpha=alpha, marker="x")
+
+    ax.set_title(title)
+    ax.set_xlabel("t-SNE 1")
+    ax.set_ylabel("t-SNE 2")
+
+    # Keep legend compact for many videos.
+    if len(unique_video_ids) <= 25:
+        ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+    plt.tight_layout()
+    if show:
+        plt.show()
+    return None if show else (fig, ax)
+
+
+def overlay_tsne_points(
+    session: dict,
+    new_embeddings: jax.Array | np.ndarray,
+    new_labels: list[str],
+    *,
+    modality: str = "video",
+    ax=None,
+    marker: str | None = None,
+    s: float = 70,
+    alpha: float = 0.95,
+    color: Any | None = None,
+    connect_to_baseline: bool = True,
+) -> np.ndarray:
+    """Transform and overlay new points onto an existing baseline t-SNE axes.
+
+    Notes:
+      - Requires a baseline session fitted by build_tsne_baseline.
+      - `new_labels` can be segment labels (e.g. '<video>#seg004'); points from
+        the same base video id share a deterministic color (unless overridden).
+    """
+    import matplotlib.pyplot as plt
+
+    new_np = _to_numpy_2d(new_embeddings, name="new_embeddings").astype(np.float32, copy=False)
+    if len(new_labels) != new_np.shape[0]:
+        raise ValueError("len(new_labels) must match new_embeddings rows")
+
+    scaler = session.get("scaler")
+    tsne_model = session.get("tsne_model")
+    if tsne_model is None:
+        raise ValueError("Session is missing `tsne_model`; cannot transform new points.")
+
+    new_proc = scaler.transform(new_np) if scaler is not None else new_np
+    new_xy = np.asarray(tsne_model.transform(new_proc), dtype=np.float32)
+    new_video_ids = [_strip_segment_suffix(lab) for lab in new_labels]
+
+    if ax is None:
+        _fig, ax = plt.subplots(figsize=(8, 6))
+
+    # 1. Draw connections to baseline points with matching labels (opposite modality)
+    if connect_to_baseline:
+        other_mod = "text" if modality == "video" else "video"
+        b_coords = session.get("baseline_coords")
+        b_labels = session.get("labels", [])
+        b_modalities = session.get("modalities", [])
+
+        # Build lookup for baseline points of the other modality
+        baseline_lookup = {}
+        if b_coords is not None:
+            for i, (lab, mod) in enumerate(zip(b_labels, b_modalities)):
+                if mod == other_mod:
+                    baseline_lookup[lab] = b_coords[i]
+
+        for i, lab in enumerate(new_labels):
+            if lab in baseline_lookup:
+                v1 = new_xy[i]
+                v2 = baseline_lookup[lab]
+                ax.plot(
+                    [v1[0], v2[0]],
+                    [v1[1], v2[1]],
+                    color="gray",
+                    alpha=0.4,
+                    linestyle=":",
+                    linewidth=1.2,
+                    zorder=0,
+                )
+
+    # 2. Plot the new points
+    point_marker = marker if marker is not None else ("^" if modality == "video" else "P")
+    for vid in sorted(set(new_video_ids)):
+        idx = [i for i, x in enumerate(new_video_ids) if x == vid]
+        xy = new_xy[np.asarray(idx)]
+        # Use provided color if available, otherwise stable video color
+        plot_color = color if color is not None else _stable_color_for_video_id(vid)
+        ax.scatter(
+            xy[:, 0],
+            xy[:, 1],
+            c=[plot_color],
+            s=s,
+            alpha=alpha,
+            marker=point_marker,
+            edgecolors="k",
+            linewidths=1.5,  # Thicker border for overlaid points
+        )
+
+    return new_xy
 
 
 # ---------------------------------------------------------------------------
@@ -624,4 +1337,219 @@ def download_checkpoint(
     print(f"Downloading checkpoint to {out} ...")
     gdown.download(gdrive_url, str(out), fuzzy=True)
     print("Download complete.")
+    return out
+
+def plot_assignment_tsne(
+    background_npz: str | Path,
+    student_video_emb: np.ndarray,
+    student_video_labels: list[str],
+    student_text_emb: np.ndarray,
+    student_text_labels: list[str],
+    perplexity: int = 30,
+    save_path: str | None = None
+):
+    """
+    Plots a t-SNE of student data overlaid on a pre-computed background.
+    
+    Visual Encoding:
+    - Background points: Small, Light Gray, Transparent.
+    - Student Video segments: Circles (o), Colored by Video ID.
+    - Student Text segments: Triangles (^), Colored by Video ID.
+    - Connections: A line connects a Text segment to its corresponding Video segment.
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+    import matplotlib.lines as mlines
+
+    # 1. Load Background Data
+    print(f"Loading background data from {background_npz}...")
+    bg_data = np.load(background_npz)
+    bg_emb = bg_data['embeddings']
+    # We don't strictly need background labels for the plot, just the points
+    
+    # 2. Combine All Data (Background + Student Video + Student Text)
+    # We must run t-SNE on the combined set so they share the same space.
+    combined_emb = np.vstack([bg_emb, student_video_emb, student_text_emb])
+    
+    # Track indices to split them back apart later
+    n_bg = len(bg_emb)
+    n_vid = len(student_video_emb)
+    n_txt = len(student_text_emb)
+    
+    print(f"Running t-SNE on {len(combined_emb)} total points...")
+    tsne = TSNE(n_components=2, init='pca', learning_rate='auto', perplexity=perplexity, random_state=42)
+    all_coords = tsne.fit_transform(combined_emb)
+    
+    # 3. Split Coordinates
+    bg_coords = all_coords[:n_bg]
+    vid_coords = all_coords[n_bg : n_bg + n_vid]
+    txt_coords = all_coords[n_bg + n_vid :]
+    
+    # 4. Setup Plot
+    fig, ax = plt.subplots(figsize=(12, 10))
+    
+    # --- Layer 1: Background (Context) ---
+    ax.scatter(
+        bg_coords[:, 0], bg_coords[:, 1],
+        c='lightgray', alpha=0.3, s=10, 
+        label='Background Data', zorder=1
+    )
+    
+    # --- Layer 2: Student Data (Focus) ---
+    # Helper to extract "root" video name from "video_name#seg001"
+    def get_root(label):
+        return label.split('#')[0]
+
+    # Identify unique videos to assign colors
+    unique_videos = list(set([get_root(l) for l in student_video_labels]))
+    colormap = plt.cm.get_cmap('tab10') # distinct colors
+    
+    # Create a lookup for video coordinates: "video_name#seg001" -> (x, y)
+    video_lookup = {label: coords for label, coords in zip(student_video_labels, vid_coords)}
+
+    print("Plotting student data...")
+    
+    # Plot per video ID so they get the same color
+    for i, video_id in enumerate(unique_videos):
+        color = colormap(i)
+        
+        # A. Plot Video Segments (Circles)
+        # Find indices for this video
+        v_indices = [idx for idx, label in enumerate(student_video_labels) if get_root(label) == video_id]
+        if v_indices:
+            ax.scatter(
+                vid_coords[v_indices, 0], vid_coords[v_indices, 1],
+                color=color, marker='o', s=100, edgecolors='white', linewidth=1.5,
+                label=f"{video_id} (Video)", zorder=3
+            )
+
+        # B. Plot Text Segments (Triangles)
+        t_indices = [idx for idx, label in enumerate(student_text_labels) if get_root(label) == video_id]
+        if t_indices:
+            ax.scatter(
+                txt_coords[t_indices, 0], txt_coords[t_indices, 1],
+                color=color, marker='^', s=120, edgecolors='black', linewidth=1.0,
+                label=f"{video_id} (Text)", zorder=3
+            )
+            
+            # C. Draw Connecting Lines
+            # For every text label, try to find the EXACT matching video segment label
+            for t_idx in t_indices:
+                t_label = student_text_labels[t_idx]
+                t_xy = txt_coords[t_idx]
+                
+                # Check if we have the corresponding video segment in our lookup
+                if t_label in video_lookup:
+                    v_xy = video_lookup[t_label]
+                    
+                    # Draw line
+                    ax.plot(
+                        [t_xy[0], v_xy[0]], [t_xy[1], v_xy[1]],
+                        color=color, alpha=0.6, linestyle='--', linewidth=1.5, zorder=2
+                    )
+
+    # 5. Polish
+    ax.set_title("Student Assignment: Video Segments vs. Text Annotations", fontsize=14)
+    ax.axis('off') # Hide axis numbers for cleaner look
+    
+    # Custom Legend
+    # We want one entry per Video ID, plus symbols for Video/Text
+    handles = []
+    # Background
+    handles.append(mlines.Line2D([], [], color='lightgray', marker='o', linestyle='None', label='Background'))
+    # Shapes
+    handles.append(mlines.Line2D([], [], color='black', marker='o', linestyle='None', label='Video Segment'))
+    handles.append(mlines.Line2D([], [], color='black', marker='^', linestyle='None', label='Text Annotation'))
+    
+    ax.legend(handles=handles, loc='best')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+        print(f"Plot saved to {save_path}")
+    
+    plt.show()
+
+def create_background_dataset(
+    video_folder: str | Path,
+    annotation_folder: str | Path,
+    output_path: str | Path = "background.npz",
+    batch_size: int = 16,
+    force_segment_level: bool = True
+) -> Path:
+    """
+    Generates a consolidated .npz file containing embeddings for all videos 
+    and annotations in the provided folders. 
+    
+    This file is intended to be distributed to students as the 'background' 
+    or 'context' for their t-SNE plots.
+
+    Args:
+        video_folder: Path to folder containing .mp4 files.
+        annotation_folder: Path to folder containing .json files.
+        output_path: Where to save the resulting .npz file.
+        batch_size: Batch size for inference (adjust based on GPU memory).
+        force_segment_level: If True, forces the model to extract segments 
+            (min_interval_segments=1) to ensure the background distribution 
+            matches the students' segment-based work.
+
+    Returns:
+        Path to the saved .npz file.
+    """
+    import numpy as np
+    import os
+
+    # Ensure model is loaded
+    if _model is None:
+        load_model()
+
+    print(f"--- Generating Background Dataset ---")
+    print(f"Video Source: {video_folder}")
+    print(f"Annotation Source: {annotation_folder}")
+
+    # 1. Compute Video Embeddings
+    # We set min_interval_segments=1 if force_segment_level is True.
+    # This prevents the model from falling back to "whole video" embeddings,
+    # ensuring the background points represent specific moments in time.
+    min_segments = 1 if force_segment_level else 2
+    
+    print(f"\n[1/3] Computing Video Embeddings (min_segments={min_segments})...")
+    bg_vid_emb, _ = get_video_embeddings(
+        video_folder,
+        annotation_folder=annotation_folder,
+        min_interval_segments=min_segments,
+        batch_size=batch_size
+    )
+
+    # 2. Compute Text Embeddings
+    print(f"\n[2/3] Computing Text Embeddings...")
+    bg_txt_emb, _ = get_text_embeddings(
+        annotation_folder,
+        segment_level=force_segment_level,
+        segment_key="video_descriptions",
+        segment_text_key="text",
+        batch_size=batch_size * 2 # Text is cheaper, can double batch
+    )
+
+    # 3. Combine and Save
+    print(f"\n[3/3] Saving to {output_path}...")
+    
+    # Concatenate video and text embeddings into one large matrix
+    # Shape: (N_video + N_text, D)
+    full_bg_embeddings = np.concatenate([bg_vid_emb, bg_txt_emb], axis=0)
+    
+    # Ensure output directory exists
+    out = Path(output_path).resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    
+    np.savez_compressed(
+        out, 
+        embeddings=full_bg_embeddings
+    )
+    
+    print(f"Success! Saved {len(full_bg_embeddings)} embeddings.")
+    print(f"Stats: {len(bg_vid_emb)} video segments, {len(bg_txt_emb)} text segments.")
+    
     return out
