@@ -836,6 +836,7 @@ def get_video_embeddings(
     batch_size: int = 1,
     num_decode_workers: int = 1,
     max_total_duration_s: float | None = None,
+    allow_full_video_fallback: bool = True,
     show_tqdm: bool = True,
 ) -> tuple[jax.Array, list[str]]:
     """Compute L2-normalized video embeddings for every ``.mp4`` in a folder.
@@ -867,6 +868,10 @@ def get_video_embeddings(
             fully sequential behavior.
         max_total_duration_s: Optional cap in seconds for total interval content
             to decode before moving to fallback/full-video decoding.
+        allow_full_video_fallback: If *False*, videos without enough valid
+            interval segments are skipped instead of being decoded as full videos.
+            Useful to avoid very high RAM use on long videos in constrained
+            environments (e.g., Colab).
         show_tqdm: Show tqdm bars for decoding and embedding loops when
             tqdm is available.
         model: Pre-loaded model object.  If *None*, uses the global singleton.
@@ -881,7 +886,7 @@ def get_video_embeddings(
     """
     import gc
     import random
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
     import torch
 
@@ -1046,6 +1051,11 @@ def get_video_embeddings(
                     f"  NOTE: only {len(intervals)} valid segments (< {min_interval_segments}) for {vf.name}; "
                     "full-video fallback"
                 )
+            if not allow_full_video_fallback:
+                _log(
+                    f"  NOTE: full-video fallback disabled; skipping {vf.name}"
+                )
+                continue
 
             task_idx = len(decode_tasks)
             decode_tasks.append((task_idx, vf, vf.stem, False, None))
@@ -1061,70 +1071,91 @@ def get_video_embeddings(
         if used_budget < 0.0:
             used_budget = 0.0
         print(f"Interval duration budget used: {used_budget:.3f}s")
-
-    decode_results: list[tuple[int, str, bool, torch.Tensor | None]] = []
-    decode_failures = 0
-    decode_zero = 0
-
-    if len(decode_tasks) > 1 and num_decode_workers > 1:
-        decode_workers = min(num_decode_workers, len(decode_tasks))
-        with ThreadPoolExecutor(max_workers=decode_workers) as executor:
-            futures = {executor.submit(_decode_worker, task) for task in decode_tasks}
-            for fut in _progress_iter(as_completed(futures), total=len(futures), desc="Decoding clips", unit="clip"):
-                task_idx, label, is_interval, tensor, err = fut.result()
-                if tensor is None:
-                    if err == "zero_frames":
-                        decode_zero += 1
-                    else:
-                        decode_failures += 1
-                        _log(f"  WARNING: failed decode for {label}: {err}")
-                    continue
-                decode_results.append((task_idx, label, is_interval, tensor))
-    else:
-        for task in _progress_iter(decode_tasks, total=len(decode_tasks), desc="Decoding clips", unit="clip"):
-            task_idx, label, is_interval, tensor, err = _decode_worker(task)
-            if tensor is None:
-                if err == "zero_frames":
-                    decode_zero += 1
-                else:
-                    decode_failures += 1
-                    _log(f"  WARNING: failed decode for {label}: {err}")
-                continue
-            decode_results.append((task_idx, label, is_interval, tensor))
-
-    if not decode_results:
+    if not decode_tasks:
         raise RuntimeError(
-            f"All videos in {video_folder} failed to decode. "
-            "Check that they are valid .mp4 files with enough frames."
+            "No decode tasks were planned. "
+            "If annotations are missing/invalid, set allow_full_video_fallback=True."
         )
-
-    decode_results.sort(key=lambda x: x[0])
 
     emb_list: list[jax.Array] = []
     labels: list[str] = []
     pending_tensors: list[torch.Tensor] = []
     pending_labels: list[str] = []
 
+    decode_failures = 0
+    decode_zero = 0
+    decode_ok = 0
     interval_attempted = sum(1 for is_interval in task_is_interval.values() if is_interval)
     interval_ok = 0
 
-    inference_tasks = _progress_iter(
-        decode_results,
-        total=len(decode_results),
-        desc="Embedding clips",
-        unit="clip",
-    )
-    for _, label, is_interval, tensor in inference_tasks:
+    def _consume_decode_result(
+        label: str,
+        is_interval: bool,
+        tensor: torch.Tensor | None,
+        err: str | None,
+    ) -> None:
+        nonlocal decode_failures, decode_zero, decode_ok, interval_ok
+        if tensor is None:
+            if err == "zero_frames":
+                decode_zero += 1
+            else:
+                decode_failures += 1
+                _log(f"  WARNING: failed decode for {label}: {err}")
+            return
+
         pending_tensors.append(tensor)
         pending_labels.append(label)
+        decode_ok += 1
         if is_interval:
             interval_ok += 1
         if len(pending_tensors) >= batch_size:
             _flush_batch(pending_tensors, pending_labels, emb_list, labels)
 
+    if len(decode_tasks) > 1 and num_decode_workers > 1:
+        decode_workers = min(num_decode_workers, len(decode_tasks))
+        task_iter = iter(decode_tasks)
+        with ThreadPoolExecutor(max_workers=decode_workers) as executor:
+            in_flight = {}
+
+            for _ in range(decode_workers):
+                task = next(task_iter, None)
+                if task is None:
+                    break
+                fut = executor.submit(_decode_worker, task)
+                in_flight[fut] = True
+
+            progress = _progress_iter(
+                range(len(decode_tasks)),
+                total=len(decode_tasks),
+                desc="Decoding+embedding clips",
+                unit="clip",
+            )
+            for _ in progress:
+                done, _pending = wait(in_flight.keys(), return_when=FIRST_COMPLETED)
+                fut = done.pop()
+                in_flight.pop(fut, None)
+
+                _task_idx, label, is_interval, tensor, err = fut.result()
+                _consume_decode_result(label, is_interval, tensor, err)
+
+                task = next(task_iter, None)
+                if task is not None:
+                    new_fut = executor.submit(_decode_worker, task)
+                    in_flight[new_fut] = True
+    else:
+        decode_progress = _progress_iter(
+            decode_tasks,
+            total=len(decode_tasks),
+            desc="Decoding+embedding clips",
+            unit="clip",
+        )
+        for task in decode_progress:
+            _task_idx, label, is_interval, tensor, err = _decode_worker(task)
+            _consume_decode_result(label, is_interval, tensor, err)
+
     _flush_batch(pending_tensors, pending_labels, emb_list, labels)
 
-    if not emb_list:
+    if decode_ok == 0 or not emb_list:
         raise RuntimeError(
             f"All videos in {video_folder} failed to decode. "
             "Check that they are valid .mp4 files with enough frames."
